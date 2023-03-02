@@ -2,17 +2,19 @@ import numpy as np
 
 from collections import deque
 import argparse
+import pathlib
+import os
+import pickle
+import random
 
 import matplotlib.pyplot as plt
 
-# PyTorch
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical
 
-# Gym
 import gymnasium as gym
 
 # Based off: https://github.com/huggingface/deep-rl-class/blob/main/notebooks/unit4/unit4.ipynb
@@ -107,6 +109,45 @@ def reinforce(policy, env, optimizer, args):
                 break
         
     return scores
+def eval(policy, env, n_eval_episodes, collect):
+    dataset = {
+        'observations': [],
+        'actions': [],
+        'rewards': [],
+        'dones': []
+    }
+    returns = []
+    for episode in range(n_eval_episodes):
+        state, info = env.reset()
+        done = False
+        total_rewards_ep = 0
+        
+        while not done:
+            action, _ = policy.act(state)
+            new_state, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+            total_rewards_ep += reward
+
+            if collect:
+                dataset['observations'].append(state)
+                dataset['actions'].append(action)
+                dataset['rewards'].append(reward)
+                dataset['dones'].append(int(done))
+
+            state=new_state
+            
+        returns.append(total_rewards_ep)
+
+    mean_return = np.mean(returns)
+    std_return = np.std(returns)
+
+    if collect:
+        for key, data in dataset.items():
+            dataset[key] = np.array(data)
+
+    return mean_return, std_return, dataset
+
+
 
 
 def main(args):
@@ -125,8 +166,32 @@ def main(args):
     policy = Policy(state_size, action_size, h_size=args.h, n_layers=args.layers, deterministic=args.deterministic_training)
     optimizer = optim.Adam(policy.parameters(), lr=args.lr)
 
+    # Train policy
     reinforce(policy, env, optimizer, args)
 
+    # Eval
+    if args.eval_episodes > 0:
+        #policy.deterministic = True
+        mean_return, std_return, dataset = eval(policy, env, args.eval_episodes, collect=args.collect)
+        print(f'mean return: {mean_return}\tstd: {std_return}')
+
+        # Save trajectories
+        if args.collect:
+            timesteps = dataset['observations'].shape[0]
+            episodes = dataset['dones'].sum()
+            data_id = random.randint(int(1e4), int(1e5) - 1)
+            print(f"Collect {episodes} trajectories with {timesteps} timesteps")
+            current_dir = pathlib.Path(__file__).parent.resolve()
+            data_dir = os.path.join(current_dir, args.save_dir)
+            data_name = f'data-t_{timesteps}-i_{data_id}.pkl'
+            data_path = os.path.join(data_dir, data_name)
+
+            with open(data_path, 'wb') as handle:
+                pickle.dump(dataset, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+        import pdb; pdb.set_trace()
+
+            
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -139,10 +204,14 @@ if __name__ == '__main__':
     parser.add_argument('--h', type=int, default=64)
     parser.add_argument('--layers', default=2, type=int)
     parser.add_argument('--lr', default=1e-2, type=float)
+
     parser.add_argument('--train_episodes', type=int, default=2500)
     parser.add_argument('-dt', '--deterministic_training', default=False, action='store_true')
     parser.add_argument('--break_at_threshold', default=False, action='store_true')
-
+    
+    parser.add_argument('--eval_episodes', type=int, default=0)
+    parser.add_argument('--collect', default=False, action='store_true', help='collect data during evaluation')
+    parser.add_argument('--save_dir', default='data', type=str)
 
     parser.add_argument('--seed', type=int, default=None, metavar='N',
                         help='random seed (default: 543)')

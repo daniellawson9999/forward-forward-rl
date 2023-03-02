@@ -2,6 +2,9 @@ import numpy as np
 
 from collections import deque
 import argparse
+import os
+import pathlib
+import pickle
 
 import matplotlib.pyplot as plt
 
@@ -50,10 +53,7 @@ class ForwardPolicy(torch.nn.Module):
         #print("goodness", goodness_per_action)
         #print("sm",F.softmax(goodness_per_action))
         #action = goodness_per_action.argmax().item()
-        try:
-            action = torch.multinomial(F.softmax(goodness_per_action),1).item()
-        except:
-            import pdb; pdb.set_trace()
+        action = torch.multinomial(F.softmax(goodness_per_action),1).item()
         return action, None
 
     def train(self, states, actions, scores):
@@ -107,7 +107,7 @@ class Layer(nn.Linear):
 
 
     
-def train_policy(policy, env, args):
+def train_policy(policy, env, dataset, args):
     gamma = args.gamma
     print_every = args.log_interval
     n_training_episodes = args.train_episodes
@@ -153,7 +153,11 @@ def train_policy(policy, env, args):
         returns = torch.tensor(returns, device=args.device)
         returns = (returns - returns.mean()) / (returns.std() + eps)
         
-        policy.train(states, actions, returns)
+        #policy.train(states, actions, returns)
+        # BC, train w/ static dataset
+        sampled_states,sampled_actions,sampled_scores = get_batch(dataset, args.batch_size)
+        sampled_scores = torch.tensor(sampled_scores, device=policy.device)
+        policy.train(sampled_states, sampled_actions, sampled_scores)
                 
         if i_episode % print_every == 0:
             avg_score = np.mean(scores_deque)
@@ -163,6 +167,24 @@ def train_policy(policy, env, args):
                 break
         
     return scores
+
+def get_batch(dataset, batch_size):
+    n_trajectories = dataset['observations'].shape[0]
+    batch_inds = np.random.choice(
+        np.arange(n_trajectories),
+        size=batch_size//2,
+        replace=True,
+    )
+    states = dataset['observations'][batch_inds]
+    actions = dataset['actions'][batch_inds]
+    scores = np.ones_like(actions)
+
+    # add negative examples
+    states = np.concatenate([states,states])
+    actions = np.concatenate([actions, 1 - actions])
+    scores = np.concatenate([scores, -scores])
+
+    return states,actions,scores
 
 
 def main(args):
@@ -177,6 +199,14 @@ def main(args):
     print('obs_space', env.observation_space)
     state_size = env.observation_space.shape[0]
     action_size = env.action_space.n 
+
+    current_dir = pathlib.Path(__file__).parent.resolve()
+    data_dir = os.path.join(current_dir, "data")
+    data_path = os.path.join(data_dir, args.data)
+    
+    with open(data_path, 'rb') as handle:
+        dataset = pickle.load(handle)
+
 
     # Optimization settings to pass to each layer
     opt_settings = {
@@ -195,7 +225,7 @@ def main(args):
     )
 
 
-    train_policy(policy, env, args)
+    train_policy(policy, env, dataset, args)
 
 
 if __name__ == '__main__':
@@ -216,6 +246,9 @@ if __name__ == '__main__':
     parser.add_argument('--train_episodes', type=int, default=2500)
     parser.add_argument('-dt', '--deterministic_training', default=False, action='store_true')
     parser.add_argument('--break_at_threshold', default=False, action='store_true')
+
+    parser.add_argument('--data', required=True, type=str)
+    parser.add_argument('--batch_size', type=int, default=64)
 
 
     parser.add_argument('--seed', type=int, default=None, metavar='N',
