@@ -21,28 +21,46 @@ import gymnasium as gym
 # ForwardFordward implementation based off https://github.com/mohammadpz/pytorch_forward_forward for MNIST
 
 
+
+scale = 500
+target_return = 500 / scale
+def discount_cumsum(x, gamma):
+    discount_cumsum = np.zeros_like(x)
+    discount_cumsum[-1] = x[-1]
+    for t in reversed(range(x.shape[0]-1)):
+        discount_cumsum[t] = x[t] + gamma * discount_cumsum[t+1]
+    return discount_cumsum
+
+
 class ForwardPolicy(torch.nn.Module):
 
-    def __init__(self, state_size, action_size, h_size,  n_layers, opt_settings, threshold, device, deterministic):
+    def __init__(self, state_size, action_size, h_size,  n_layers, opt_settings, threshold, device, deterministic, model_reward):
         super().__init__()
         self.state_size = state_size
         self.action_size = action_size
         self.device = device
         self.threshold = threshold
         self.deterministic = deterministic
-        dims = [state_size + action_size] # add extra dimension for onehot action
+        self.model_reward = model_reward
+
+        first_dim = state_size + action_size
+        if model_reward:
+            first_dim += 1
+        dims = [first_dim] # add extra dimension for onehot action
+
         for _ in range(n_layers):
             dims.append(h_size)
         self.layers = []
         for d in range(len(dims) - 1):
             self.layers += [Layer(dims[d], dims[d + 1], threshold=threshold, opt_settings=opt_settings).to(device=self.device)]
     
-    def act(self, state):
-        state = torch.tensor(state, device=self.device).unsqueeze(0)
+    def act(self, state, target_return):
+        state = torch.tensor(state, device=self.device, dtype=torch.float32).unsqueeze(0)
+        target_return = torch.tensor(target_return, device=0, dtype=torch.float32).reshape(1,1)
         goodness_per_action = []
         for action in range(self.action_size):
             action = torch.tensor(action, device=self.device).unsqueeze(0)
-            h = self.combine_state_action(state, action)
+            h = self.combine_transitions(state, action, target_return)
             goodness = []
             for layer in self.layers:
                 h = layer(h)
@@ -56,10 +74,10 @@ class ForwardPolicy(torch.nn.Module):
         action = torch.multinomial(F.softmax(goodness_per_action),1).item()
         return action, None
 
-    def train(self, states, actions, scores):
-        states = torch.tensor(np.stack(states), device=self.device)
+    def train(self, states, actions, scores, returns):
+        states = torch.tensor(np.stack(states), device=self.device, dtype=torch.float32)
         actions = torch.tensor(np.array(actions), device=self.device)
-        states = self.combine_state_action(states, actions)
+        states = self.combine_transitions(states, actions, returns)
         
         h = states
         for i, layer in enumerate(self.layers):
@@ -67,9 +85,11 @@ class ForwardPolicy(torch.nn.Module):
             h = layer.train(h, scores)
 
     # Wrapping w/ policy
-    def combine_state_action(self, states, actions):
+    def combine_transitions(self, states, actions, returns):
         onehot_actions = F.one_hot(actions, num_classes=self.action_size).to(device=self.device)
         states = torch.concat([states, onehot_actions], dim=-1)
+        if self.model_reward:
+            states = torch.concat([states, returns], dim=-1)
         return states
     
 
@@ -124,9 +144,11 @@ def train_policy(policy, env, dataset, args):
         states = []
         state, info = env.reset()
         done = False
+        rtg = target_return
         while not done:
-            action, prob = policy.act(state)
+            action, prob = policy.act(state, rtg)
             state, reward, terminated, truncated, info = env.step(action)
+            rtg -= reward / scale
             done = terminated or truncated
 
             actions.append(action)
@@ -150,14 +172,15 @@ def train_policy(policy, env, dataset, args):
         eps = np.finfo(np.float32).eps.item()
         ## eps is the smallest representable float, which is 
         # added to the standard deviation of the returns to avoid numerical instabilities        
-        returns = torch.tensor(returns, device=args.device)
+        returns = torch.tensor(returns, device=args.device, dtype=torch.float32)
         returns = (returns - returns.mean()) / (returns.std() + eps)
         
         #policy.train(states, actions, returns)
         # BC, train w/ static dataset
-        sampled_states,sampled_actions,sampled_scores = get_batch(dataset, args.batch_size)
-        sampled_scores = torch.tensor(sampled_scores, device=policy.device)
-        policy.train(sampled_states, sampled_actions, sampled_scores)
+        sampled_states,sampled_actions,sampled_scores, sampled_returns = get_batch(dataset, args.batch_size)
+        sampled_scores = torch.tensor(sampled_scores, device=policy.device,dtype=torch.float32)
+        sampled_returns = torch.tensor(sampled_returns, device=policy.device, dtype=torch.float32).reshape(-1, 1)
+        policy.train(sampled_states, sampled_actions, sampled_scores, sampled_returns)
                 
         if i_episode % print_every == 0:
             avg_score = np.mean(scores_deque)
@@ -177,14 +200,16 @@ def get_batch(dataset, batch_size):
     )
     states = dataset['observations'][batch_inds]
     actions = dataset['actions'][batch_inds]
+    returns = dataset['rtg'][batch_inds] / scale
     scores = np.ones_like(actions)
 
     # add negative examples
     states = np.concatenate([states,states])
+    returns = np.concatenate([returns,returns])
     actions = np.concatenate([actions, 1 - actions])
     scores = np.concatenate([scores, -scores])
 
-    return states,actions,scores
+    return states,actions,scores,returns
 
 
 def main(args):
@@ -207,6 +232,17 @@ def main(args):
     with open(data_path, 'rb') as handle:
         dataset = pickle.load(handle)
 
+    # Add return-to-go terms
+    dataset['rtg'] = []
+    ends = np.nonzero(dataset['dones'])[0]
+    for i in range(len(ends)):
+        if i == 0:
+            start_index = 0
+        else:
+            start_index = ends[i - 1] + 1
+        end_index = ends[i]
+        ep_rtg = discount_cumsum(dataset['rewards'][start_index:end_index+1], args.gamma)
+        dataset['rtg'] = np.append(dataset['rtg'], ep_rtg)
 
     # Optimization settings to pass to each layer
     opt_settings = {
@@ -221,7 +257,8 @@ def main(args):
         opt_settings=opt_settings,
         device=args.device,
         threshold=args.threshold,
-        deterministic=args.deterministic_training, 
+        deterministic=args.deterministic_training,
+        model_reward=args.model_reward 
     )
 
 
@@ -234,8 +271,7 @@ if __name__ == '__main__':
     parser.add_argument('--render', default=False,action='store_true')
     parser.add_argument('--device', type=str, default='cuda')
 
-    parser.add_argument('--gamma', type=float, default=0.99, metavar='G',
-                        help='discount factor (default: 0.99)')
+    parser.add_argument('--gamma', type=float, default=1)
 
     parser.add_argument('--h', type=int, default=64)
     parser.add_argument('--layers', default=2, type=int)
@@ -249,6 +285,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--data', required=True, type=str)
     parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--model_reward', default=False, action='store_true')
 
 
     parser.add_argument('--seed', type=int, default=None, metavar='N',
