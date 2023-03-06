@@ -144,7 +144,8 @@ def train_policy(policy, env, args):
         # Compute the discounted returns at each timestep,
         for t in range(n_steps)[::-1]:
             disc_return_t = (returns[0] if len(returns)>0 else 0)
-            returns.appendleft( gamma*disc_return_t + rewards[t]   )    
+            returns.appendleft( gamma*disc_return_t + rewards[t]   ) 
+        #returns = [sum(rewards)] * len(rewards)
             
         ## standardization of the returns is employed to make training more stable
         eps = np.finfo(np.float32).eps.item()
@@ -152,6 +153,7 @@ def train_policy(policy, env, args):
         # added to the standard deviation of the returns to avoid numerical instabilities        
         returns = torch.tensor(returns, device=args.device)
         returns = (returns - returns.mean()) / (returns.std() + eps)
+        #returns = (returns - (np.mean(scores[-10:])+1e-4)) / (returns.std() + eps)
         
         policy.train(states, actions, returns)
                 
@@ -204,7 +206,7 @@ if __name__ == '__main__':
     parser.add_argument('--render', default=False,action='store_true')
     parser.add_argument('--device', type=str, default='cuda')
 
-    parser.add_argument('--gamma', type=float, default=0.99, metavar='G',
+    parser.add_argument('--gamma', type=float, default=1, metavar='G',
                         help='discount factor (default: 0.99)')
 
     parser.add_argument('--h', type=int, default=64)
