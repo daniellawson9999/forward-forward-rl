@@ -112,7 +112,8 @@ class Layer(nn.Linear):
 
     def train(self, x, score):
         for i in range(self.inner_updates):
-            logits = self.forward(x).pow(2).mean(1) - self.threshold
+            h = self.forward(x)
+            logits = h.pow(2).mean(1) - self.threshold
             logits = -logits * score
             # The following loss pushes pos (neg) samples to
             # values larger (smaller) than the self.threshold.
@@ -177,7 +178,7 @@ def train_policy(policy, env, dataset, args):
         
         #policy.train(states, actions, returns)
         # BC, train w/ static dataset
-        sampled_states,sampled_actions,sampled_scores, sampled_returns = get_batch(dataset, args.batch_size)
+        sampled_states,sampled_actions,sampled_scores, sampled_returns = get_batch(dataset, args.batch_size, args)
         sampled_scores = torch.tensor(sampled_scores, device=policy.device,dtype=torch.float32)
         sampled_returns = torch.tensor(sampled_returns, device=policy.device, dtype=torch.float32).reshape(-1, 1)
         policy.train(sampled_states, sampled_actions, sampled_scores, sampled_returns)
@@ -191,24 +192,42 @@ def train_policy(policy, env, dataset, args):
         
     return scores
 
-def get_batch(dataset, batch_size):
+def get_batch(dataset, batch_size, args):
     n_trajectories = dataset['observations'].shape[0]
     batch_inds = np.random.choice(
         np.arange(n_trajectories),
         size=batch_size//2,
         replace=True,
     )
-    states = dataset['observations'][batch_inds]
-    actions = dataset['actions'][batch_inds]
-    returns = dataset['rtg'][batch_inds] / scale
-    scores = np.ones_like(actions)
+    p_states = dataset['observations'][batch_inds]
+    p_actions = dataset['actions'][batch_inds]
+    p_returns = dataset['rtg'][batch_inds] / scale
+    p_scores = np.ones_like(p_actions)
 
-    # add negative examples
-    states = np.concatenate([states,states])
-    returns = np.concatenate([returns,returns])
-    actions = np.concatenate([actions, 1 - actions])
-    scores = np.concatenate([scores, -scores])
+    #n_states = states
+    n_returns = np.random.uniform(0,1, p_states.shape[0])
+    n_actions = 1 - p_actions
+    n_scores = -p_scores
 
+    # Only actions negative
+    states = np.concatenate([p_states,p_states])
+    returns = np.concatenate([p_returns,p_returns])
+    actions = np.concatenate([p_actions, n_actions])
+    scores = np.concatenate([p_scores, n_scores])
+
+    if args.model_reward:
+        # Negative return and actions
+        states = np.concatenate([states,p_states])
+        returns = np.concatenate([returns,n_returns])
+        actions = np.concatenate([actions, n_actions])
+        scores = np.concatenate([scores, n_scores])
+
+        # Just negative returns
+        states = np.concatenate([states,p_states])
+        returns = np.concatenate([returns,n_returns])
+        actions = np.concatenate([actions, p_actions])
+        scores = np.concatenate([scores, n_scores])
+    
     return states,actions,scores,returns
 
 
@@ -258,7 +277,7 @@ def main(args):
         device=args.device,
         threshold=args.threshold,
         deterministic=args.deterministic_training,
-        model_reward=args.model_reward 
+        model_reward=args.model_reward ,
     )
 
 
@@ -278,6 +297,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr', default=3e-2, type=float)
     parser.add_argument('--inner_updates', default=10, type=int)
     parser.add_argument('--threshold', type=float, default=2)
+    parser.add_argument('--regularize', default=False, action='store_true')
 
     parser.add_argument('--train_episodes', type=int, default=2500)
     parser.add_argument('-dt', '--deterministic_training', default=False, action='store_true')
